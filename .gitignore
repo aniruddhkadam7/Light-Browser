@@ -1,0 +1,5 @@
+build/
+*.user
+*.user.*
+CMakeFiles/
+CMakeCache.txt
