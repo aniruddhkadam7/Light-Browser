@@ -3,3 +3,8 @@ build/
 *.user.*
 CMakeFiles/
 CMakeCache.txt
+
+# Packaging output: the staged Qt/WebEngine deployment and compiled
+# installer are large, regeneratable build artifacts, not source.
+package/stage/
+package/LightBrowserSetup.exe
