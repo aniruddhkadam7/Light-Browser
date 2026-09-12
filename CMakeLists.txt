@@ -8,7 +8,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets WebEngineWidgets WebEngineCore)
+find_package(Qt6 REQUIRED COMPONENTS Widgets WebEngineWidgets WebEngineCore Network WebChannel)
 
 qt_standard_project_setup()
 
@@ -26,6 +26,12 @@ qt_add_executable(LightBrowser
     src/DownloadManager.h
     src/HistoryManager.cpp
     src/HistoryManager.h
+    src/NewTabPage.cpp
+    src/NewTabPage.h
+    src/SearchProvider.cpp
+    src/SearchProvider.h
+    src/OmniboxBridge.cpp
+    src/OmniboxBridge.h
     src/BookmarkManager.cpp
     src/BookmarkManager.h
     src/AddressSuggestionPopup.cpp
@@ -44,6 +50,8 @@ target_link_libraries(LightBrowser PRIVATE
     Qt6::Widgets
     Qt6::WebEngineWidgets
     Qt6::WebEngineCore
+    Qt6::Network
+    Qt6::WebChannel
 )
 
 set_target_properties(LightBrowser PROPERTIES

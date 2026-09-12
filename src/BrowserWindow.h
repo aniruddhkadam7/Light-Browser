@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QSet>
 #include <QWebEnginePage>
 #include <QUrl>
 
@@ -10,6 +11,9 @@ class QLineEdit;
 class QToolButton;
 class QLabel;
 class QWebEngineView;
+class QWebEngineProfile;
+class QNetworkAccessManager;
+class QTimer;
 class DownloadManager;
 class HistoryManager;
 class BookmarkManager;
@@ -21,7 +25,11 @@ class BrowserWindow : public QMainWindow
 {
     Q_OBJECT
 public:
-    explicit BrowserWindow(QWidget *parent = nullptr);
+    // incognito is purely cosmetic here: title/badge only. It's the exact
+    // same profile, history, cookies and everything else as a regular
+    // window — nothing is actually isolated or left unrecorded.
+    explicit BrowserWindow(QWidget *parent = nullptr, bool incognito = false);
+    ~BrowserWindow() override;
 
 protected:
     void changeEvent(QEvent *event) override;
@@ -36,7 +44,22 @@ private slots:
 private:
     QWebEngineView *currentView() const;
     QWebEngineView *createTabView();
-    QWebEngineView *addNewTab(const QUrl &url, bool focusAddressBar = true);
+    // An empty/invalid url (the default) opens the local New Tab page
+    // instead of navigating anywhere.
+    QWebEngineView *addNewTab(const QUrl &url = QUrl(), bool focusAddressBar = true);
+    // Loads the local, static New Tab page into view — matching Most
+    // Visited tiles from local history, backfilling any missing site icons
+    // in the background (see fetchMissingFavicons()).
+    void showNewTabPage(QWebEngineView *view);
+    // One tiny favicon.ico request per site missing a cached icon (not a
+    // full page load) so Most Visited tiles show real site logos, Chrome/
+    // Brave-style, instead of staying on the letter-avatar fallback forever.
+    // Skipped entirely for sites already cached.
+    void fetchMissingFavicons();
+    void refreshOpenNewTabPages();
+    // Lazily-created, shared by favicon backfill and by each tab's omnibox
+    // suggestion bridge — a plain HTTP client, nothing WebEngine-specific.
+    QNetworkAccessManager *networkManager();
     QWebEnginePage *handleNewWindowRequest(QWebEnginePage::WebWindowType type);
     // Routes through UrlRedirectManager: if `url` matches a mapping rule's
     // source pattern, actually navigates to the mapped target instead.
@@ -61,6 +84,9 @@ private:
     void updateProfileAvatar();
     void showMainMenu();
     void showHistoryPage();
+    // Opens another regular BrowserWindow, just labeled "Incognito" — see
+    // the constructor comment for what that does and doesn't mean.
+    void openIncognitoWindow();
     void showUrlMappingSettings();
     void toggleDownloadsPopup();
     // Clicking a toolbar toggle button while its own popup is open lands
@@ -118,4 +144,26 @@ private:
     QLineEdit *m_findEdit = nullptr;
 
     qint64 m_lastPopupCloseMs = 0;
+
+    QNetworkAccessManager *m_networkManager = nullptr;
+    QSet<QString> m_faviconFetchesInFlight; // registrable domains, to dedupe
+    QSet<QWebEngineView *> m_newTabViews; // views currently on the New Tab page
+
+    // Drives the animated tab-loading spinner (see iconSpinner() in
+    // BrowserWindow.cpp): only runs while at least one tab is loading, and
+    // stops itself once none are, rather than ticking constantly.
+    QTimer *m_spinnerTimer = nullptr;
+    int m_spinnerAngle = 0;
+
+    const bool m_incognito;
+    QToolButton *m_incognitoBadge = nullptr;
+    // Regular windows use the shared QWebEngineProfile::defaultProfile();
+    // Incognito windows get their own off-the-record instance instead. Not
+    // for isolation (this incognito mode is still cosmetic-only) but for
+    // stability: Qt WebEngine does not cleanly support two independent
+    // top-level windows tearing down QWebEngineView/Page children that
+    // share one live profile object — destroying one window's pages while
+    // the other's are still active was crashing the whole process. A
+    // separate profile per window sidesteps that entirely.
+    QWebEngineProfile *m_profile = nullptr;
 };

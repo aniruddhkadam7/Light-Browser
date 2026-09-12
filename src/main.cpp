@@ -2,6 +2,8 @@
 
 #include <QApplication>
 #include <QIcon>
+#include <QRegularExpression>
+#include <QWebEngineProfile>
 
 int main(int argc, char *argv[])
 {
@@ -13,7 +15,33 @@ int main(int argc, char *argv[])
     // --enable-gpu-rasterization makes Chromium actually rasterize on the
     // GPU rather than just compositing already-software-drawn tiles. Must be
     // set before QApplication exists — Chromium reads it at engine init.
-    qputenv("QTWEBENGINE_CHROMIUM_FLAGS", "--ignore-gpu-blocklist --enable-gpu-rasterization");
+    // --disable-features=UserAgentClientHint turns off Chromium's separate
+    // "User-Agent Client Hints" headers (Sec-CH-UA / Sec-CH-UA-Full-Version-
+    // List). Those carry their own embedder brand entry (QtWebEngine) that a
+    // plain httpUserAgent() override further down doesn't touch — sites can
+    // still read it there even after the classic User-Agent string is
+    // cleaned up, which is exactly what kept Google's sign-in flow blocking
+    // this browser as an unrecognized embedded WebView. This turns the
+    // extra header channel off rather than fabricating a fake brand for it.
+    // --enable-zero-copy avoids an extra texture copy in the rasterization
+    // path. --disable-features=CalculateNativeWinOcclusion turns off
+    // Chromium's window-occlusion detection, which misfires on non-standard
+    // (frameless/custom-chrome) top-level windows like this one's and can
+    // skip painting a visible frame — a documented cause of a page
+    // appearing to blink.
+    //
+    // Deliberately NOT forcing --use-angle=d3d11 / --force_high_performance_gpu
+    // here: chrome://gpu showed those made things worse, not better — with
+    // them, "Direct Rendering Display Compositor" (the DirectComposition
+    // path that hands frames straight to the Windows compositor — the main
+    // thing that makes scrolling actually smooth) came back Disabled even
+    // though Compositing/Rasterization both still reported "Hardware
+    // accelerated". Chromium's own auto-detection picks the right backend
+    // more often than a hardcoded one on a system with drivers from more
+    // than one GPU vendor loaded, which this one has.
+    qputenv("QTWEBENGINE_CHROMIUM_FLAGS",
+            "--ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy "
+            "--disable-features=UserAgentClientHint,CalculateNativeWinOcclusion");
 
     // QtWebEngine derives its default persistent-profile storage path from
     // these; without them the default profile silently runs off-the-record,
@@ -39,6 +67,18 @@ int main(int argc, char *argv[])
 
     QApplication app(argc, argv);
     app.setWindowIcon(QIcon(":/app.ico"));
+
+    // Google's sign-in flow (and some other sites) refuses to complete OAuth
+    // at all for any browser whose User-Agent advertises "QtWebEngine/x.y.z"
+    // — "This browser or app may not be secure" — treating it as an
+    // unrecognized embedded WebView. Stripping just that one vendor token
+    // (keeping the real Chrome/xxx version Qt's own Chromium build already
+    // reports, not a fabricated one) is enough to pass that check.
+    QWebEngineProfile *defaultProfile = QWebEngineProfile::defaultProfile();
+    QString userAgent = defaultProfile->httpUserAgent();
+    static const QRegularExpression qtWebEngineToken(QStringLiteral(" QtWebEngine/\\S+"));
+    userAgent.remove(qtWebEngineToken);
+    defaultProfile->setHttpUserAgent(userAgent);
 
     BrowserWindow window;
     window.showMaximized();

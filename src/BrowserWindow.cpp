@@ -4,6 +4,8 @@
 #include "BrowserWindow.h"
 #include "DownloadManager.h"
 #include "HistoryManager.h"
+#include "NewTabPage.h"
+#include "SearchProvider.h"
 #include "UrlMappingSettingsDialog.h"
 #include "TabView.h"
 #include "UrlRedirectManager.h"
@@ -11,6 +13,8 @@
 #include "WebView.h"
 
 #include <QAction>
+#include <QActionGroup>
+#include <QBuffer>
 #include <QEvent>
 #include <QHBoxLayout>
 #include <QInputDialog>
@@ -19,6 +23,9 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
@@ -32,6 +39,7 @@
 #include <QStandardPaths>
 #include <QStyleOptionTab>
 #include <QTabBar>
+#include <QTimer>
 #include <QToolButton>
 #include <QUrlQuery>
 #include <QVBoxLayout>
@@ -44,19 +52,24 @@
 #include <functional>
 
 namespace {
-const QUrl kHomeUrl("https://www.google.com");
 
-// Google's own <title> for a search results page is "<query> - Google
-// Search"; the tab should instead show just "<query> - Search" — this is
-// the one deliberate override of the page's real title, tab title only.
-QString googleSearchTabTitle(const QUrl &url)
+// A results page's own <title> is usually "<query> - <Provider> Search" or
+// similar; the tab should instead show just "<query> - Search" — this is the
+// one deliberate override of the page's real title, tab title only. Works
+// for whichever provider is currently configured (see SearchProvider.h), not
+// just Google.
+QString searchTabTitle(const QUrl &url)
 {
-    if (!url.host().contains(QLatin1String("google.")) || url.path() != QLatin1String("/search"))
+    const SearchProvider provider = SearchProviders::current();
+    if (!url.host().contains(provider.tabTitleHostMarker))
         return QString();
-    QString query = QUrlQuery(url).queryItemValue(QStringLiteral("q"), QUrl::FullyDecoded);
-    query.replace(QLatin1Char('+'), QLatin1Char(' '));
-    query = query.trimmed();
-    return query.isEmpty() ? QString() : query + QStringLiteral(" - Search");
+    const QUrlQuery query(url);
+    if (!query.hasQueryItem(QStringLiteral("q")))
+        return QString();
+    QString text = query.queryItemValue(QStringLiteral("q"), QUrl::FullyDecoded);
+    text.replace(QLatin1Char('+'), QLatin1Char(' '));
+    text = text.trimmed();
+    return text.isEmpty() ? QString() : text + QStringLiteral(" - Search");
 }
 
 // Hand-drawn monoline icons instead of emoji glyphs: emoji render in full
@@ -73,6 +86,18 @@ QIcon paintIcon(int size, const std::function<void(QPainter &, qreal)> &draw)
     draw(painter, static_cast<qreal>(size));
     painter.end();
     return QIcon(pixmap);
+}
+
+QByteArray iconToPng(const QIcon &icon)
+{
+    const QPixmap pixmap = icon.pixmap(32, 32);
+    if (pixmap.isNull())
+        return QByteArray();
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    buffer.open(QIODevice::WriteOnly);
+    pixmap.save(&buffer, "PNG");
+    return bytes;
 }
 
 QPen linePen(const QColor &color, qreal width = 1.5)
@@ -183,6 +208,33 @@ QIcon iconStarFilled(const QColor &c)
     });
 }
 
+// Chrome/Brave's own incognito glyph: a hat brim over sunglasses — kept as
+// the same flat monoline style as every other icon here rather than a
+// colored emoji, but unmistakably "the incognito icon" at a glance.
+QIcon iconIncognito(const QColor &c)
+{
+    return paintIcon(18, [c](QPainter &p, qreal s) {
+        p.setPen(Qt::NoPen);
+        p.setBrush(c);
+        // Hat brim.
+        p.drawRoundedRect(QRectF(s * 0.08, s * 0.30, s * 0.84, s * 0.10), s * 0.05, s * 0.05);
+        // Hat crown.
+        QPainterPath crown;
+        crown.moveTo(s * 0.30, s * 0.30);
+        crown.cubicTo(s * 0.34, s * 0.10, s * 0.66, s * 0.10, s * 0.70, s * 0.30);
+        p.drawPath(crown);
+        // Glasses: two lenses joined by a bridge, with short temple arms.
+        p.setPen(linePen(c, s * 0.09));
+        p.setBrush(Qt::NoBrush);
+        const qreal lensY = s * 0.58, lensR = s * 0.16;
+        p.drawEllipse(QPointF(s * 0.28, lensY), lensR, lensR);
+        p.drawEllipse(QPointF(s * 0.72, lensY), lensR, lensR);
+        p.drawLine(QPointF(s * 0.44, lensY), QPointF(s * 0.56, lensY));
+        p.drawLine(QPointF(0, lensY - s * 0.04), QPointF(s * 0.12, lensY));
+        p.drawLine(QPointF(s, lensY - s * 0.04), QPointF(s * 0.88, lensY));
+    });
+}
+
 QIcon iconPuzzle(const QColor &c)
 {
     return paintIcon(18, [c](QPainter &p, qreal s) {
@@ -266,6 +318,25 @@ QIcon iconNewTabPage(const QColor &c)
     });
 }
 
+// Animated loading spinner shown in a tab's icon slot while its page is
+// loading — otherwise the tab just sits on its old/blank icon with no
+// feedback at all until loadFinished. angleDeg advances each timer tick
+// (see the spinner QTimer set up in createTabView) to animate the rotation.
+QIcon iconSpinner(const QColor &c, int angleDeg)
+{
+    return paintIcon(16, [c, angleDeg](QPainter &p, qreal s) {
+        const QRectF rect(s * 0.16, s * 0.16, s * 0.68, s * 0.68);
+        QColor track = c;
+        track.setAlpha(70);
+        p.setPen(QPen(track, s * 0.16, Qt::SolidLine, Qt::RoundCap));
+        p.setBrush(Qt::NoBrush);
+        p.drawEllipse(rect);
+
+        p.setPen(QPen(c, s * 0.16, Qt::SolidLine, Qt::RoundCap));
+        p.drawArc(rect, -angleDeg * 16, 100 * 16);
+    });
+}
+
 // Generic globe favicon for a loaded page that has no favicon of its own,
 // matching Edge's fallback (rather than leaving the tab with a blank icon
 // slot once a real page has loaded).
@@ -290,43 +361,6 @@ QIcon iconSearchGlyph(const QColor &c)
         p.setBrush(Qt::NoBrush);
         p.drawEllipse(QRectF(s * 0.14, s * 0.14, s * 0.5, s * 0.5));
         p.drawLine(QPointF(s * 0.58, s * 0.58), QPointF(s * 0.86, s * 0.86));
-    });
-}
-
-// The one deliberate departure from this file's flat-monoline-icon rule:
-// the address bar shows the real (simplified) Google "G" mark in place of
-// the lock icon on a blank/new tab, matching Edge's own default — a generic
-// line icon wouldn't read as "this searches Google" the way the real mark
-// does.
-QIcon iconGoogleG()
-{
-    return paintIcon(16, [](QPainter &p, qreal s) {
-        const QRectF outer(s * 0.05, s * 0.05, s * 0.9, s * 0.9);
-        const qreal thickness = s * 0.24;
-        const QRectF inner = outer.adjusted(thickness, thickness, -thickness, -thickness);
-        QPainterPath ring;
-        ring.addEllipse(outer);
-        QPainterPath hole;
-        hole.addEllipse(inner);
-        ring = ring.subtracted(hole);
-
-        p.save();
-        p.setClipPath(ring);
-        p.setPen(Qt::NoPen);
-        p.setBrush(QColor(0xea, 0x43, 0x35));
-        p.drawPie(outer, 45 * 16, 90 * 16);
-        p.setBrush(QColor(0xfb, 0xbc, 0x05));
-        p.drawPie(outer, 135 * 16, 90 * 16);
-        p.setBrush(QColor(0x34, 0xa8, 0x53));
-        p.drawPie(outer, 225 * 16, 90 * 16);
-        p.setBrush(QColor(0x42, 0x85, 0xf4));
-        p.drawPie(outer, 315 * 16, 90 * 16);
-        p.restore();
-
-        p.setPen(Qt::NoPen);
-        p.setBrush(QColor(0x42, 0x85, 0xf4));
-        p.drawRect(QRectF(outer.center().x() - thickness * 0.15, outer.center().y() - thickness / 2,
-                           outer.right() - (outer.center().x() - thickness * 0.15), thickness));
     });
 }
 
@@ -613,45 +647,75 @@ private:
 };
 }
 
-BrowserWindow::BrowserWindow(QWidget *parent)
-    : QMainWindow(parent)
+BrowserWindow::BrowserWindow(QWidget *parent, bool incognito)
+    : QMainWindow(parent), m_incognito(incognito)
 {
+
     // Edge/Chrome fold the title bar into the tab strip, so there is no
     // separate OS-drawn caption row above it. Go frameless and draw our own
     // min/maximize/close controls in the tab row instead.
     setWindowFlag(Qt::FramelessWindowHint);
     resize(1280, 800);
-    setWindowTitle(tr("LightBrowser"));
+    setWindowTitle(m_incognito ? tr("Incognito - LightBrowser") : tr("LightBrowser"));
 
-    QWebEngineProfile *profile = QWebEngineProfile::defaultProfile();
+    if (m_incognito) {
+        // A profile constructed with no name is off-the-record by Qt
+        // WebEngine's own definition (cookies/cache/storage all stay in
+        // memory, nothing touches disk) — but the reason it's *required*
+        // here, not just a nice bonus, is that reusing the shared default
+        // profile's live QWebEngineView/Page objects across two
+        // independently closable top-level windows was what crashed the
+        // whole process when one of them closed while the other's pages
+        // were still active. A separate profile object per window avoids
+        // that entirely. Everything else about this window (history,
+        // bookmarks, badge) is still the same cosmetic-only "incognito" as
+        // before — this is purely a stability fix.
+        m_profile = new QWebEngineProfile(this);
+        QString ua = m_profile->httpUserAgent();
+        ua.remove(QRegularExpression(R"(\s*QtWebEngine/\S+)"));
+        ua.replace(QRegularExpression(R"(Windows NT [\d.]+)"), "Windows NT 10.0");
+        m_profile->setHttpUserAgent(ua);
+        m_profile->settings()->setAttribute(QWebEngineSettings::PdfViewerEnabled, true);
+    } else {
+        m_profile = QWebEngineProfile::defaultProfile();
 
-    // QtWebEngine's default UA advertises "QtWebEngine/x.y.z", which sites like
-    // Google flag as non-standard and respond to with repeated captcha challenges.
-    // Stripping that token leaves an accurate Chrome/<version> UA for the
-    // Chromium actually embedded, without claiming a fake browser identity.
-    QString ua = profile->httpUserAgent();
-    ua.remove(QRegularExpression(R"(\s*QtWebEngine/\S+)"));
-    // QtWebEngine misreports the OS as "Windows NT 6.2" (Windows 8) on this
-    // build; correct it to match the real, current Windows version.
-    ua.replace(QRegularExpression(R"(Windows NT [\d.]+)"), "Windows NT 10.0");
-    profile->setHttpUserAgent(ua);
+        // Only ever configured once, on the first (necessarily non-
+        // incognito) window — Qt WebEngine does not support reconfiguring a
+        // profile's storage/cache path once it already has active pages, so
+        // a second regular window must not repeat this.
+        static bool profileConfigured = false;
+        if (!profileConfigured) {
+            profileConfigured = true;
 
-    profile->setPersistentCookiesPolicy(QWebEngineProfile::ForcePersistentCookies);
+            // QtWebEngine's default UA advertises "QtWebEngine/x.y.z", which sites like
+            // Google flag as non-standard and respond to with repeated captcha challenges.
+            // Stripping that token leaves an accurate Chrome/<version> UA for the
+            // Chromium actually embedded, without claiming a fake browser identity.
+            QString ua = m_profile->httpUserAgent();
+            ua.remove(QRegularExpression(R"(\s*QtWebEngine/\S+)"));
+            // QtWebEngine misreports the OS as "Windows NT 6.2" (Windows 8) on this
+            // build; correct it to match the real, current Windows version.
+            ua.replace(QRegularExpression(R"(Windows NT [\d.]+)"), "Windows NT 10.0");
+            m_profile->setHttpUserAgent(ua);
 
-    // Match Edge/Chrome: open PDFs in the built-in viewer instead of forcing
-    // them through downloadRequested like any other file.
-    profile->settings()->setAttribute(QWebEngineSettings::PdfViewerEnabled, true);
+            m_profile->setPersistentCookiesPolicy(QWebEngineProfile::ForcePersistentCookies);
 
-    // The default profile has no storage path configured, which leaves it
-    // running off-the-record: no cookies survive a restart, so every launch
-    // looks like a brand-new anonymous session to Google's abuse detection
-    // and triggers repeated "unusual traffic" captchas.
-    const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    profile->setPersistentStoragePath(dataDir + "/profile");
-    profile->setCachePath(dataDir + "/cache");
+            // Match Edge/Chrome: open PDFs in the built-in viewer instead of forcing
+            // them through downloadRequested like any other file.
+            m_profile->settings()->setAttribute(QWebEngineSettings::PdfViewerEnabled, true);
+
+            // The default profile has no storage path configured, which leaves it
+            // running off-the-record: no cookies survive a restart, so every launch
+            // looks like a brand-new anonymous session to Google's abuse detection
+            // and triggers repeated "unusual traffic" captchas.
+            const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+            m_profile->setPersistentStoragePath(dataDir + "/profile");
+            m_profile->setCachePath(dataDir + "/cache");
+        }
+    }
 
     m_downloadManager = new DownloadManager(this);
-    connect(profile, &QWebEngineProfile::downloadRequested,
+    connect(m_profile, &QWebEngineProfile::downloadRequested,
             m_downloadManager, &DownloadManager::handleDownload);
     connect(m_downloadManager, &DownloadManager::downloadStarted, this, [this] {
         if (m_downloadsButton)
@@ -670,7 +734,7 @@ BrowserWindow::BrowserWindow(QWidget *parent)
     QWidget *tabRow = buildTabStrip();
     QWidget *navToolbar = buildToolbar();
 
-    m_suggestions = new AddressSuggestionPopup(m_addressBar, m_history, m_bookmarks, m_addressBar);
+    m_suggestions = new AddressSuggestionPopup(m_addressBar, m_history, m_bookmarks, networkManager(), m_addressBar);
     connect(m_suggestions, &AddressSuggestionPopup::urlChosen, this, [this](const QUrl &url) {
         navigateViewTo(currentView(), url);
     });
@@ -703,7 +767,25 @@ BrowserWindow::BrowserWindow(QWidget *parent)
     setupShortcuts();
     applyEdgeTheme();
 
-    addNewTab(kHomeUrl, /*focusAddressBar=*/false);
+    addNewTab(QUrl(), /*focusAddressBar=*/false);
+}
+
+BrowserWindow::~BrowserWindow()
+{
+    // Root-caused crash fix: each WebView's destroyed() handler (see
+    // createTabView()) touches m_newTabViews — a plain BrowserWindow data
+    // member. C++ destroys derived-class data members *before* running the
+    // QObject/QWidget base-class destructor that would otherwise destroy
+    // these widget children — so left to the implicit teardown, that lambda
+    // fires against an already-destructed QSet and crashes (reproduced via
+    // a symbolicated crash dump: QSet<QWebEngineView*>::remove ->
+    // findBucket, called from ~BrowserWindow's own implicit member/base
+    // teardown). Deleting every tab's WebView explicitly here, first, means
+    // their destroyed() signals fire while m_newTabViews is still alive.
+    if (m_stack) {
+        const auto views = m_stack->findChildren<QWebEngineView *>();
+        qDeleteAll(views);
+    }
 }
 
 QWebEngineView *BrowserWindow::currentView() const
@@ -716,9 +798,28 @@ QWebEngineView *BrowserWindow::currentView() const
 QWebEngineView *BrowserWindow::createTabView()
 {
     auto *view = new WebView(this);
-    auto *page = new WebPage(QWebEngineProfile::defaultProfile(), m_redirectManager,
+    connect(view, &QObject::destroyed, this, [this, view] { m_newTabViews.remove(view); });
+    auto *page = new WebPage(m_profile, m_redirectManager,
                               [this](QWebEnginePage::WebWindowType type) {
                                   return handleNewWindowRequest(type);
+                              },
+                              [this, view](const QString &text) {
+                                  // The New Tab page's omnibox tags an explicitly-chosen
+                                  // suggestion so it bypasses resolveInput()'s own
+                                  // URL-vs-search guess: "search:" always searches (even
+                                  // if the text happens to look host-like) and "url:" is
+                                  // already the exact address the JS resolved. Plain text
+                                  // (a bare Enter with no suggestion selected, or a
+                                  // history-row URL) still goes through resolveInput() —
+                                  // unchanged from before this feature existed.
+                                  if (text.startsWith(QLatin1String("search:"))) {
+                                      navigateViewTo(view, SearchProviders::buildSearchUrl(
+                                                                SearchProviders::current(), text.mid(7)));
+                                  } else if (text.startsWith(QLatin1String("url:"))) {
+                                      navigateViewTo(view, QUrl(text.mid(4)));
+                                  } else {
+                                      navigateViewTo(view, resolveInput(text));
+                                  }
                               },
                               view);
     view->setPage(page);
@@ -731,7 +832,7 @@ QWebEngineView *BrowserWindow::createTabView()
         const int idx = m_stack->indexOf(view->parentWidget());
         if (idx < 0)
             return;
-        if (!googleSearchTabTitle(view->url()).isEmpty())
+        if (!searchTabTitle(view->url()).isEmpty())
             m_tabBar->setTabIcon(idx, iconSearchGlyph(QColor(0x4a, 0x9e, 0xf0)));
         else
             m_tabBar->setTabIcon(idx, realIcon.isNull() ? iconGlobe(kMutedIconColor) : realIcon);
@@ -740,7 +841,7 @@ QWebEngineView *BrowserWindow::createTabView()
     connect(view, &QWebEngineView::titleChanged, this, [this, view, refreshTabIcon](const QString &title) {
         const int idx = m_stack->indexOf(view->parentWidget());
         if (idx >= 0) {
-            const QString searchTitle = googleSearchTabTitle(view->url());
+            const QString searchTitle = searchTabTitle(view->url());
             m_tabBar->setTabText(idx, !searchTitle.isEmpty() ? searchTitle
                                       : title.isEmpty()      ? tr("New Tab")
                                                               : title);
@@ -750,8 +851,13 @@ QWebEngineView *BrowserWindow::createTabView()
             updateWindowTitle(title);
     });
 
-    connect(view, &QWebEngineView::iconChanged, this, [refreshTabIcon](const QIcon &icon) {
+    connect(view, &QWebEngineView::iconChanged, this, [this, view, refreshTabIcon](const QIcon &icon) {
         refreshTabIcon(icon);
+        // Just persisting the favicon QtWebEngine already fetched for this
+        // visit (for New Tab's Most Visited tiles) — no extra network
+        // request of our own.
+        if (!icon.isNull())
+            m_history->setFavicon(displayUrlFor(view), iconToPng(icon));
     });
 
     connect(view, &QWebEngineView::urlChanged, this, [this, view, refreshTabIcon](const QUrl &url) {
@@ -768,6 +874,34 @@ QWebEngineView *BrowserWindow::createTabView()
         view->setProperty("loading", true);
         if (view == currentView())
             updateReloadStopAction();
+
+        // Lazily created once, shared by every tab; ticks only while at
+        // least one tab is actually loading (self-stops otherwise) so it's
+        // not running continuously in the background.
+        if (!m_spinnerTimer) {
+            m_spinnerTimer = new QTimer(this);
+            m_spinnerTimer->setInterval(80);
+            connect(m_spinnerTimer, &QTimer::timeout, this, [this] {
+                m_spinnerAngle = (m_spinnerAngle + 30) % 360;
+                bool anyLoading = false;
+                for (int i = 0; i < m_stack->count(); ++i) {
+                    auto *tv = qobject_cast<TabView *>(m_stack->widget(i));
+                    QWebEngineView *v = tv ? tv->webView() : nullptr;
+                    if (v && v->property("loading").toBool()) {
+                        anyLoading = true;
+                        m_tabBar->setTabIcon(i, iconSpinner(kMutedIconColor, m_spinnerAngle));
+                    }
+                }
+                if (!anyLoading)
+                    m_spinnerTimer->stop();
+            });
+        }
+        if (!m_spinnerTimer->isActive())
+            m_spinnerTimer->start();
+        // Show it immediately rather than waiting up to one tick interval.
+        const int idx = m_stack->indexOf(view->parentWidget());
+        if (idx >= 0)
+            m_tabBar->setTabIcon(idx, iconSpinner(kMutedIconColor, m_spinnerAngle));
     });
 
     connect(view, &QWebEngineView::loadFinished, this, [this, view, refreshTabIcon](bool ok) {
@@ -809,8 +943,20 @@ QWebEngineView *BrowserWindow::addNewTab(const QUrl &url, bool focusAddressBar)
     m_tabBar->setTabIcon(tabIdx, iconNewTabPage(kMutedIconColor));
     attachTabCloseButton(tabIdx);
     m_tabBar->setCurrentIndex(tabIdx);
-    navigateViewTo(view, url);
 
+    if (url.isEmpty()) {
+        // setHtml() doesn't change the view's url() away from about:blank
+        // (its default before any load), so urlChanged never fires here —
+        // unlike the branch below, there's no async navigation to wait on.
+        showNewTabPage(view);
+        if (focusAddressBar) {
+            m_addressBar->setFocus();
+            m_addressBar->selectAll();
+        }
+        return view;
+    }
+
+    navigateViewTo(view, url);
     if (focusAddressBar) {
         // Focus once the address bar actually reflects the new tab's URL
         // (SingleShotConnection) rather than racing the async urlChanged
@@ -906,7 +1052,7 @@ QWidget *BrowserWindow::buildTabStrip()
     m_newTabButton->setObjectName("newTabButton");
     m_newTabButton->setText(QStringLiteral("+"));
     m_newTabButton->setToolTip(tr("New tab"));
-    connect(m_newTabButton, &QToolButton::clicked, this, [this] { addNewTab(kHomeUrl); });
+    connect(m_newTabButton, &QToolButton::clicked, this, [this] { addNewTab(); });
 
     m_minButton = new QToolButton(this);
     m_minButton->setObjectName("captionButton");
@@ -1062,7 +1208,7 @@ QWidget *BrowserWindow::buildToolbar()
     m_addressBar = new QLineEdit(addressBar);
     m_addressBar->setObjectName("addressEdit");
     m_addressBar->setFrame(false);
-    m_addressBar->setPlaceholderText(tr("Ask Google or type a URL"));
+    m_addressBar->setPlaceholderText(tr("Search or type a URL"));
     connect(m_addressBar, &QLineEdit::returnPressed, this, &BrowserWindow::navigateToAddress);
 
     m_dualUrlToggle = new QToolButton(addressBar);
@@ -1103,6 +1249,23 @@ QWidget *BrowserWindow::buildToolbar()
     m_extensionsButton->setToolTip(tr("Extensions"));
     connect(m_extensionsButton, &QToolButton::clicked, this, &BrowserWindow::showExtensionsMenu);
 
+    if (m_incognito) {
+        // The one clear "how do I get out of this" control: clicking it
+        // closes this Incognito window, same as clicking its own [x] would.
+        // Chrome/Brave don't have a dedicated button either — closing the
+        // window *is* how you leave incognito — but making that the result
+        // of an obvious click here is what was actually asked for.
+        m_incognitoBadge = new QToolButton(navToolbar);
+        m_incognitoBadge->setObjectName("incognitoBadge");
+        m_incognitoBadge->setIcon(iconIncognito(QColor(0xd7, 0xcd, 0xea)));
+        m_incognitoBadge->setIconSize(QSize(18, 18));
+        m_incognitoBadge->setText(tr("Incognito"));
+        m_incognitoBadge->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        m_incognitoBadge->setToolTip(tr("You've gone Incognito. Click to close this window."));
+        m_incognitoBadge->setCursor(Qt::PointingHandCursor);
+        connect(m_incognitoBadge, &QToolButton::clicked, this, &BrowserWindow::close);
+    }
+
     m_profileAvatar = new QLabel(navToolbar);
     m_profileAvatar->setObjectName("profileAvatar");
     m_profileAvatar->setAlignment(Qt::AlignCenter);
@@ -1120,6 +1283,8 @@ QWidget *BrowserWindow::buildToolbar()
     navLayout->addWidget(m_favoriteButton);
     navLayout->addWidget(m_downloadsButton);
     navLayout->addWidget(m_extensionsButton);
+    if (m_incognitoBadge)
+        navLayout->addWidget(m_incognitoBadge);
     navLayout->addWidget(m_profileAvatar);
     navLayout->addWidget(m_menuButton);
 
@@ -1133,7 +1298,9 @@ void BrowserWindow::setupShortcuts()
         m_addressBar->selectAll();
     });
 
-    new QShortcut(QKeySequence("Ctrl+T"), this, [this] { addNewTab(kHomeUrl); });
+    new QShortcut(QKeySequence("Ctrl+T"), this, [this] { addNewTab(); });
+
+    new QShortcut(QKeySequence("Ctrl+Shift+N"), this, [this] { openIncognitoWindow(); });
 
     new QShortcut(QKeySequence("Ctrl+W"), this, [this] { closeTab(m_tabBar->currentIndex()); });
 
@@ -1210,6 +1377,9 @@ void BrowserWindow::navigateViewTo(QWebEngineView *view, const QUrl &url)
 {
     if (!view || url.isEmpty())
         return;
+    m_newTabViews.remove(view);
+    if (auto *page = qobject_cast<WebPage *>(view->page()))
+        page->detachOmniboxChannel();
     QUrl mapped;
     const bool ruleMatched = m_redirectManager->resolve(url, &mapped);
 
@@ -1225,6 +1395,84 @@ void BrowserWindow::navigateViewTo(QWebEngineView *view, const QUrl &url)
 
     if (view == currentView())
         updateUrlBar(view->url());
+}
+
+void BrowserWindow::showNewTabPage(QWebEngineView *view)
+{
+    if (!view)
+        return;
+    // No mapping rule can apply to a page that never navigated anywhere.
+    view->setProperty("requestedUrl", QVariant());
+    if (auto *page = qobject_cast<WebPage *>(view->page()))
+        page->attachOmniboxChannel(networkManager());
+    const QString providerName = SearchProviders::current().displayName;
+    view->page()->setHtml(m_incognito ? NewTabPage::buildIncognito(providerName)
+                                       : NewTabPage::build(m_history->mostVisited(), m_history->recentEntries(200),
+                                                            providerName),
+                           QUrl("about:blank"));
+    m_newTabViews.insert(view);
+    if (!m_incognito)
+        fetchMissingFavicons();
+
+    if (view == currentView())
+        updateUrlBar(view->url());
+}
+
+QNetworkAccessManager *BrowserWindow::networkManager()
+{
+    if (!m_networkManager) {
+        m_networkManager = new QNetworkAccessManager(this);
+        m_networkManager->setTransferTimeout(5000);
+    }
+    return m_networkManager;
+}
+
+void BrowserWindow::fetchMissingFavicons()
+{
+    for (const HistoryEntry &entry : m_history->mostVisited()) {
+        if (!entry.favicon.isEmpty())
+            continue;
+        const QString host = entry.url.host();
+        if (host.isEmpty() || m_faviconFetchesInFlight.contains(host))
+            continue;
+        m_faviconFetchesInFlight.insert(host);
+
+        QUrl faviconUrl;
+        faviconUrl.setScheme(QStringLiteral("https"));
+        faviconUrl.setHost(host);
+        faviconUrl.setPath(QStringLiteral("/favicon.ico"));
+
+        QNetworkRequest request(faviconUrl);
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                              QVariant::fromValue(QNetworkRequest::NoLessSafeRedirectPolicy));
+        // Several CDNs/WAFs (seen on google.com, apple.com, meta.com,
+        // linkedin.com) silently hang requests with no User-Agent instead of
+        // responding — this is the same header a browser would send anyway.
+        request.setHeader(QNetworkRequest::UserAgentHeader,
+                           QStringLiteral("Mozilla/5.0 (Windows NT 10.0; Win64; x64) LightBrowser/1.0"));
+        QNetworkReply *reply = networkManager()->get(request);
+        const QUrl pageUrl = entry.url;
+        connect(reply, &QNetworkReply::finished, this, [this, reply, pageUrl, host] {
+            reply->deleteLater();
+            m_faviconFetchesInFlight.remove(host);
+
+            if (reply->error() != QNetworkReply::NoError)
+                return;
+            QPixmap pixmap;
+            if (!pixmap.loadFromData(reply->readAll()) || pixmap.isNull())
+                return;
+
+            m_history->setFavicon(pageUrl, iconToPng(QIcon(pixmap)));
+            refreshOpenNewTabPages();
+        });
+    }
+}
+
+void BrowserWindow::refreshOpenNewTabPages()
+{
+    const QSet<QWebEngineView *> views = m_newTabViews;
+    for (QWebEngineView *view : views)
+        showNewTabPage(view);
 }
 
 void BrowserWindow::toggleReloadStop()
@@ -1256,17 +1504,24 @@ void BrowserWindow::updateUrlBar(const QUrl &actualUrl)
     // have no recorded request, so fall back to the real URL for those.
     const QUrl display = displayUrlFor(currentView());
     // A blank/new tab (nothing ever navigated to) shows an empty bar with
-    // the "Ask Google or type a URL" placeholder and Google's own mark,
-    // matching Edge's default new-tab address bar, instead of a raw
-    // "about:blank" and a padlock that implies a real, secure page.
+    // the "Search or type a URL" placeholder and a generic search glyph —
+    // provider-neutral now that the search engine is configurable — instead
+    // of a raw "about:blank" and a padlock that implies a real, secure page.
     const bool blank = display.isEmpty() || display.scheme() == QLatin1String("about");
-    m_lockLabel->setPixmap(blank ? iconGoogleG().pixmap(16, 16) : iconLock(kMutedIconColor).pixmap(13, 13));
+    m_lockLabel->setPixmap(blank ? iconSearchGlyph(kMutedIconColor).pixmap(16, 16)
+                                  : iconLock(kMutedIconColor).pixmap(13, 13));
     m_addressBar->setText(blank ? QString() : display.toString());
     // QLineEdit::setText() leaves the cursor (and visible scroll position) at
     // the end of the text; for a long URL that scrolls the domain out of
     // view, showing garbled tracking-parameter tail characters instead. Real
     // address bars always show the start of the URL first.
     m_addressBar->setCursorPosition(0);
+    // setText() above is programmatic (a real navigation just landed), not
+    // the user typing — textEdited/FocusOut don't fire for it, so without
+    // this the suggestion popup could keep floating over the bar with
+    // whatever was typed before the navigation.
+    if (m_suggestions)
+        m_suggestions->closeNow();
 }
 
 QUrl BrowserWindow::displayUrlFor(QWebEngineView *view) const
@@ -1403,8 +1658,9 @@ void BrowserWindow::showMainMenu()
     QMenu menu(this);
     menu.setObjectName("chromeMenu");
 
-    menu.addAction(tr("New tab\tCtrl+T"), this, [this] { addNewTab(kHomeUrl); });
+    menu.addAction(tr("New tab\tCtrl+T"), this, [this] { addNewTab(); });
     menu.addAction(tr("Close tab\tCtrl+W"), this, [this] { closeTab(m_tabBar->currentIndex()); });
+    menu.addAction(tr("New Incognito window\tCtrl+Shift+N"), this, &BrowserWindow::openIncognitoWindow);
     menu.addSeparator();
 
     QAction *findAction = menu.addAction(tr("Find on page\tCtrl+F"));
@@ -1435,6 +1691,24 @@ void BrowserWindow::showMainMenu()
     // wherever it last was — off in a corner rather than near this menu.
     menu.addAction(tr("Downloads"), this, &BrowserWindow::toggleDownloadsPopup);
     menu.addAction(tr("History\tCtrl+H"), this, &BrowserWindow::showHistoryPage);
+
+    // Takes effect immediately — SearchProviders::current() re-reads this
+    // QSettings key live, so both the address bar and every open/future New
+    // Tab page's omnibox pick it up on their very next search, no restart.
+    QMenu *searchEngineMenu = menu.addMenu(tr("Search engine"));
+    searchEngineMenu->setObjectName("chromeMenu");
+    auto *searchEngineGroup = new QActionGroup(searchEngineMenu);
+    searchEngineGroup->setExclusive(true);
+    const QString currentProviderId = SearchProviders::current().id;
+    for (const SearchProvider &provider : SearchProviders::all()) {
+        QAction *action = searchEngineMenu->addAction(provider.displayName);
+        action->setCheckable(true);
+        action->setChecked(provider.id == currentProviderId);
+        searchEngineGroup->addAction(action);
+        connect(action, &QAction::triggered, this,
+                [id = provider.id] { QSettings().setValue(QStringLiteral("searchProviderId"), id); });
+    }
+
     menu.addAction(tr("Settings"), this, &BrowserWindow::showUrlMappingSettings);
     menu.addSeparator();
     menu.addAction(tr("About LightBrowser"), this, [this] {
@@ -1475,6 +1749,16 @@ void BrowserWindow::showHistoryPage()
     view->setHtml(html, QUrl("about:blank"));
 }
 
+void BrowserWindow::openIncognitoWindow()
+{
+    // Cosmetic only (see the constructor) — a normal, separate top-level
+    // window, just titled/badged "Incognito". WA_DeleteOnClose cleans it up
+    // when closed, same as any other top-level window.
+    auto *window = new BrowserWindow(nullptr, /*incognito=*/true);
+    window->setAttribute(Qt::WA_DeleteOnClose);
+    window->showMaximized();
+}
+
 void BrowserWindow::showUrlMappingSettings()
 {
     UrlMappingSettingsDialog dlg(m_redirectManager, this);
@@ -1501,7 +1785,8 @@ void BrowserWindow::toggleDownloadsPopup()
 
 void BrowserWindow::updateWindowTitle(const QString &pageTitle)
 {
-    setWindowTitle(pageTitle.isEmpty() ? tr("LightBrowser") : pageTitle + tr(" - LightBrowser"));
+    const QString appName = m_incognito ? tr("Incognito - LightBrowser") : tr("LightBrowser");
+    setWindowTitle(pageTitle.isEmpty() ? appName : pageTitle + tr(" - ") + appName);
 }
 
 QUrl BrowserWindow::resolveInput(const QString &textIn) const
@@ -1525,11 +1810,7 @@ QUrl BrowserWindow::resolveInput(const QString &textIn) const
         return QUrl("https://" + text);
     }
 
-    QUrl searchUrl("https://www.google.com/search");
-    QUrlQuery query;
-    query.addQueryItem("q", text);
-    searchUrl.setQuery(query);
-    return searchUrl;
+    return SearchProviders::buildSearchUrl(SearchProviders::current(), text);
 }
 
 void BrowserWindow::changeEvent(QEvent *event)
@@ -1571,7 +1852,7 @@ void BrowserWindow::updateMaximizeButtonIcon()
 
 void BrowserWindow::applyEdgeTheme()
 {
-    setStyleSheet(R"(
+    QString sheet = R"(
         QWidget#centralWidget, QStackedWidget, QMainWindow {
             background: #1b1b1c;
         }
@@ -1745,5 +2026,28 @@ void BrowserWindow::applyEdgeTheme()
             background: #3a3a3c;
             margin: 4px 8px;
         }
-    )");
+    )";
+
+    if (m_incognito) {
+        // Chrome/Brave's own tell for an incognito window: a distinct
+        // near-black, purple-tinted chrome instead of the regular neutral
+        // dark gray, so it's unmistakable at a glance which window is which.
+        sheet += R"(
+        QWidget#tabRow { background: #1a1025; border-bottom: 1px solid #0c0810; }
+        QWidget#navToolbar { background: #241934; }
+        QWidget#addressBar { background: #150e20; }
+        QToolButton#incognitoBadge {
+            background: transparent;
+            border: none;
+            border-radius: 14px;
+            padding: 0 10px;
+            color: #d7cdEA;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        QToolButton#incognitoBadge:hover { background: rgba(255, 255, 255, 0.10); }
+        )";
+    }
+
+    setStyleSheet(sheet);
 }
